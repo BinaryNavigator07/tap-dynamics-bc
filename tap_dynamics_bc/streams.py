@@ -843,9 +843,7 @@ class SemanticEventsStream(dynamicsBcStream):
 
     def get_records(self, context):
         """
-        Emit all business events for a given company.
-        context comes from CompaniesStream.get_child_context:
-        { "company_id": ..., "company_name": ... }
+        Emit all business events for a given company..
         """
         company_id = context["company_id"]
         company_name = context.get("company_name")
@@ -856,6 +854,7 @@ class SemanticEventsStream(dynamicsBcStream):
         payment_terms_by_id = _build_lookup(PaymentTermsStream, self, context, "id")
         accounts_by_id = _build_lookup(AccountsStream, self, context, "id")
         locations_by_id = _build_lookup(LocationsStream, self, context, "id")
+        vendor_journals_by_id = _build_lookup(VendorPaymentJournalsStream, self, context, "id")
 
         company_info_stream = CompanyInformationStream(tap=self._tap)
         company_infos = list(company_info_stream.get_records(context))
@@ -875,36 +874,77 @@ class SemanticEventsStream(dynamicsBcStream):
             for line in inv.get("purchaseInvoiceLines", []):
                 item = items_by_id.get(line.get("itemId"))
                 event = self._build_purchase_event(
-                    inv, line, vendor, vendor_summary, item, company_ctx
+                    inv=inv,
+                    line=line,
+                    vendor=vendor,
+                    vendor_summary=vendor_summary,
+                    item=item,
+                    company_ctx=company_ctx,
                 )
                 yield event
 
         sales_stream = SalesInvoicesStream(tap=self._tap)
         for inv in sales_stream.get_records(context):
             pt = payment_terms_by_id.get(inv.get("paymentTermsId"))
+
             for line in inv.get("salesInvoiceLines", []):
                 item = items_by_id.get(line.get("itemId"))
                 event = self._build_sales_invoice_event(
-                    inv, line, item, pt, company_ctx
+                    inv=inv,
+                    line=line,
+                    item=item,
+                    payment_terms=pt,
+                    company_ctx=company_ctx,
                 )
                 yield event
 
         so_stream = SalesOrdersStream(tap=self._tap)
         for order in so_stream.get_records(context):
             pt = payment_terms_by_id.get(order.get("paymentTermsId"))
+
             for line in order.get("salesOrderLines", []):
                 item = items_by_id.get(line.get("itemId"))
                 location = locations_by_id.get(line.get("locationId"))
                 event = self._build_sales_order_event(
-                    order, line, item, pt, location, company_ctx
+                    order=order,
+                    line=line,
+                    item=item,
+                    payment_terms=pt,
+                    location=location,
+                    company_ctx=company_ctx,
                 )
                 yield event
 
         gl_stream = GeneralLedgerEntriesStream(tap=self._tap)
         for gle in gl_stream.get_records(context):
             account = accounts_by_id.get(gle.get("accountId"))
-            event = self._build_gl_event(gle, account, company_ctx)
+            event = self._build_gl_event(
+                gle=gle,
+                account=account,
+                company_ctx=company_ctx,
+            )
             yield event
+
+
+        vp_stream = VendorPaymentsStream(tap=self._tap)
+        for journal_id, journal in vendor_journals_by_id.items():
+            journal_ctx = {
+                "company_id": company_id,
+                "company_name": company_name,
+                "journal_id": journal_id,
+            }
+
+            for payment in vp_stream.get_records(journal_ctx):
+                vendor = vendors_by_id.get(payment.get("vendorId"))
+                vendor_summary = vendor_purchases_by_vendor.get(payment.get("vendorId"))
+                event = self._build_vendor_payment_event(
+                    payment=payment,
+                    journal=journal,
+                    vendor=vendor,
+                    vendor_summary=vendor_summary,
+                    company_ctx=company_ctx,
+                )
+                yield event
 
 
     def _base_event(self, event_name, timestamp, company_ctx, document_id=None, line_seq=None):
@@ -927,13 +967,14 @@ class SemanticEventsStream(dynamicsBcStream):
             parts.append(str(line_seq))
         return "|".join(parts)
 
+
     def _build_purchase_event(self, inv, line, vendor, vendor_summary, item, company_ctx):
         base = self._base_event(
-            "purchase_line_booked",
-            inv.get("postingDate"),
-            company_ctx,
-            inv.get("id"),
-            line.get("sequence"),
+            event_name="purchase_line_booked",
+            timestamp=inv.get("postingDate"),
+            company_ctx=company_ctx,
+            document_id=inv.get("id"),
+            line_seq=line.get("sequence"),
         )
         base["properties"] = {
             "invoice_header": inv,
@@ -947,11 +988,11 @@ class SemanticEventsStream(dynamicsBcStream):
 
     def _build_sales_invoice_event(self, inv, line, item, payment_terms, company_ctx):
         base = self._base_event(
-            "sales_line_booked",
-            inv.get("postingDate"),
-            company_ctx,
-            inv.get("id"),
-            line.get("sequence"),
+            event_name="sales_line_booked",
+            timestamp=inv.get("postingDate"),
+            company_ctx=company_ctx,
+            document_id=inv.get("id"),
+            line_seq=line.get("sequence"),
         )
         base["properties"] = {
             "invoice_header": inv,
@@ -964,11 +1005,11 @@ class SemanticEventsStream(dynamicsBcStream):
 
     def _build_sales_order_event(self, order, line, item, payment_terms, location, company_ctx):
         base = self._base_event(
-            "sales_order_line_booked",
-            order.get("orderDate"),
-            company_ctx,
-            order.get("id"),
-            line.get("sequence"),
+            event_name="sales_order_line_booked",
+            timestamp=order.get("orderDate"),
+            company_ctx=company_ctx,
+            document_id=order.get("id"),
+            line_seq=line.get("sequence"),
         )
         base["properties"] = {
             "order_header": order,
@@ -982,15 +1023,32 @@ class SemanticEventsStream(dynamicsBcStream):
 
     def _build_gl_event(self, gle, account, company_ctx):
         base = self._base_event(
-            "gl_entry_posted",
-            gle.get("postingDate"),
-            company_ctx,
-            gle.get("id"),
-            None,
+            event_name="gl_entry_posted",
+            timestamp=gle.get("postingDate"),
+            company_ctx=company_ctx,
+            document_id=gle.get("id"),
+            line_seq=None,
         )
         base["properties"] = {
             "gl_entry": gle,
             "account": account,
+            "company": company_ctx,
+        }
+        return base
+
+    def _build_vendor_payment_event(self, payment, journal, vendor, vendor_summary, company_ctx):
+        base = self._base_event(
+            event_name="vendor_payment_posted",
+            timestamp=payment.get("postingDate"),
+            company_ctx=company_ctx,
+            document_id=payment.get("id"),
+            line_seq=payment.get("lineNumber"),
+        )
+        base["properties"] = {
+            "payment": payment,
+            "payment_journal": journal,
+            "vendor": vendor,
+            "vendor_purchase_summary": vendor_summary,
             "company": company_ctx,
         }
         return base
