@@ -8,6 +8,14 @@ from singer_sdk.exceptions import FatalAPIError
 from tap_dynamics_bc.client import dynamicsBcStream
 
 
+def _build_lookup(stream_cls, tap, context, key_field):
+    """
+    Instantiate a stream and build a dict of {key_field: record}.
+    """
+    stream = stream_cls(tap=tap)
+    records = list(stream.get_records(context))  # small-ish sets: vendors, items, etc.
+    return {rec[key_field]: rec for rec in records if rec.get(key_field) is not None}
+
 class CompaniesStream(dynamicsBcStream):
     """Define custom stream."""
 
@@ -807,3 +815,190 @@ class PaymentTermsStream(dynamicsBcStream):
 
 
 
+class SemanticEventsStream(dynamicsBcStream):
+    """Semantic merged business events."""
+
+    name = "semantic_events"
+    # We don't use path/url_base here because we override get_records completely.
+    path = ""  # not used
+    parent_stream_type = CompaniesStream
+    primary_keys = ["event_id"]
+    replication_key = None  # start with full loads; can optimize later
+
+    schema = th.PropertiesList(
+        th.Property("type", th.StringType),
+        th.Property("event", th.StringType),
+        th.Property("timestamp", th.DateTimeType),
+        th.Property("entity_gid", th.StringType),
+        th.Property("company_id", th.StringType),
+        th.Property("company_name", th.StringType),
+        th.Property("event_id", th.StringType),
+        th.Property("document_id", th.StringType),
+        th.Property("line_sequence", th.IntegerType),
+        th.Property("properties", th.ObjectType()),
+    ).to_dict()
+
+    def get_records(self, context):
+        """
+        Emit all business events for a given company.
+        context comes from CompaniesStream.get_child_context:
+        { "company_id": ..., "company_name": ... }
+        """
+
+        company_id = context["company_id"]
+        company_name = context.get("company_name")
+
+        tap = self.tap
+
+        # --- Build lookups (dimension-ish stuff) ---
+        vendors_by_id = _build_lookup(VendorsStream, tap, context, "id")
+        vendor_purchases_by_vendor = _build_lookup(VendorPurchases, tap, context, "vendorId")
+        items_by_id = _build_lookup(ItemsStream, tap, context, "id")
+        payment_terms_by_id = _build_lookup(PaymentTermsStream, tap, context, "id")
+        accounts_by_id = _build_lookup(AccountsStream, tap, context, "id")
+        locations_by_id = _build_lookup(LocationsStream, tap, context, "id")
+
+        # company info: usually 1 record per company
+        company_info_stream = CompanyInformationStream(tap=tap)
+        company_infos = list(company_info_stream.get_records(context))
+        company_info = company_infos[0] if company_infos else {}
+
+        # You can bundle company ctx once
+        company_ctx = {
+            "company_id": company_id,
+            "company_name": company_name,
+            **company_info,
+        }
+
+        # --- 1) purchase_line_booked events ---
+        purchase_stream = PurchaseInvoicesStream(tap=tap)
+        for inv in purchase_stream.get_records(context):
+            vendor = vendors_by_id.get(inv.get("vendorId"))
+            vendor_summary = vendor_purchases_by_vendor.get(inv.get("vendorId"))
+
+            for line in inv.get("purchaseInvoiceLines", []):
+                item = items_by_id.get(line.get("itemId"))
+                event = self._build_purchase_event(
+                    inv, line, vendor, vendor_summary, item, company_ctx
+                )
+                yield event
+
+        # --- 2) sales_line_booked events ---
+        sales_stream = SalesInvoicesStream(tap=tap)
+        for inv in sales_stream.get_records(context):
+            pt = payment_terms_by_id.get(inv.get("paymentTermsId"))
+            for line in inv.get("salesInvoiceLines", []):
+                item = items_by_id.get(line.get("itemId"))
+                event = self._build_sales_invoice_event(
+                    inv, line, item, pt, company_ctx
+                )
+                yield event
+
+        # --- 3) sales_order_line_booked events ---
+        so_stream = SalesOrdersStream(tap=tap)
+        for order in so_stream.get_records(context):
+            pt = payment_terms_by_id.get(order.get("paymentTermsId"))
+            for line in order.get("salesOrderLines", []):
+                item = items_by_id.get(line.get("itemId"))
+                location = locations_by_id.get(line.get("locationId"))
+                event = self._build_sales_order_event(
+                    order, line, item, pt, location, company_ctx
+                )
+                yield event
+
+        # --- 4) gl_entry_posted events ---
+        gl_stream = GeneralLedgerEntriesStream(tap=tap)
+        for gle in gl_stream.get_records(context):
+            account = accounts_by_id.get(gle.get("accountId"))
+            event = self._build_gl_event(gle, account, company_ctx)
+            yield event
+
+    # ------- helper methods to standardize event shape -------
+
+    def _base_event(self, event_name, timestamp, company_ctx, document_id=None, line_seq=None):
+        return {
+            "type": "track",
+            "event": event_name,
+            "timestamp": timestamp,
+            "entity_gid": company_ctx["company_id"],
+            "company_id": company_ctx["company_id"],
+            "company_name": company_ctx.get("company_name"),
+            "document_id": document_id,
+            "line_sequence": line_seq,
+            "event_id": self._make_event_id(event_name, document_id, line_seq),
+        }
+
+    @staticmethod
+    def _make_event_id(event_name, document_id, line_seq):
+        parts = [event_name, document_id or ""]
+        if line_seq is not None:
+            parts.append(str(line_seq))
+        return "|".join(parts)
+
+    def _build_purchase_event(self, inv, line, vendor, vendor_summary, item, company_ctx):
+        base = self._base_event(
+            "purchase_line_booked",
+            inv.get("postingDate"),
+            company_ctx,
+            inv.get("id"),
+            line.get("sequence"),
+        )
+        base["properties"] = {
+            "invoice_header": inv,
+            "invoice_line": line,
+            "vendor": vendor,
+            "vendor_purchase_summary": vendor_summary,
+            "item": item,
+            "company": company_ctx,
+        }
+        return base
+
+    def _build_sales_invoice_event(self, inv, line, item, payment_terms, company_ctx):
+        base = self._base_event(
+            "sales_line_booked",
+            inv.get("postingDate"),
+            company_ctx,
+            inv.get("id"),
+            line.get("sequence"),
+        )
+        base["properties"] = {
+            "invoice_header": inv,
+            "invoice_line": line,
+            "item": item,
+            "payment_terms": payment_terms,
+            "company": company_ctx,
+        }
+        return base
+
+    def _build_sales_order_event(self, order, line, item, payment_terms, location, company_ctx):
+        base = self._base_event(
+            "sales_order_line_booked",
+            order.get("orderDate"),
+            company_ctx,
+            order.get("id"),
+            line.get("sequence"),
+        )
+        base["properties"] = {
+            "order_header": order,
+            "order_line": line,
+            "item": item,
+            "payment_terms": payment_terms,
+            "location": location,
+            "company": company_ctx,
+        }
+        return base
+
+    def _build_gl_event(self, gle, account, company_ctx):
+        base = self._base_event(
+            "gl_entry_posted",
+            gle.get("postingDate"),
+            company_ctx,
+            gle.get("id"),
+            None,
+        )
+        base["properties"] = {
+            "gl_entry": gle,
+            "account": account,
+            "company": company_ctx,
+        }
+        return base
